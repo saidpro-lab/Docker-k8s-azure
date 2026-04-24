@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mariadb-config
+  namespace: glpi
+data:
+  MYSQL_DATABASE: "glpi"
+  MYSQL_USER: "glpi_user"
