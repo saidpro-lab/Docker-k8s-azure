@@ -1,113 +1,170 @@
 # Docker-k8s-azure
 Déploiement de GLPI sur Azure Kubernetes Service (AKS)
-# 🐳 Docker Swarm — Déploiement HA de GLPI
 
-> TP pratique — Formation AIS Bac+3 | Module : Infrastructure & Conteneurisation  
-> Durée : 4h | Prérequis : TP Docker Compose v1 réalisé
+# ☸️ Kubernetes AKS — Déploiement de GLPI sur Azure
+
+> TP pratique — Formation AIS Bac+3 | Module : Infrastructure Cloud & Conteneurisation  
+> Prérequis : Docker Compose, Docker Swarm, bases Linux, YAML  
+> Outils : Azure CLI, kubectl, PowerShell 7, VS Code
 
 ---
 
 ## 🎯 Objectif
 
-Déployer GLPI en **haute disponibilité** sur un cluster Docker Swarm multi-nœuds avec stockage partagé NFS, puis tester la résilience face à une panne simulée.
+Déployer GLPI sur **Azure Kubernetes Service (AKS)** en deux versions :
+
+- **V1** — Déploiement de base avec IP publique (HTTP)
+- **V2** — Sécurisation HTTPS avec Ingress-nginx + cert-manager + Let's Encrypt automatique
 
 ---
 
-## 🖥️ Infrastructure du lab
+## 📐 Architecture
 
-| VM | Rôle | IP Fixe | RAM | CPU |
-|----|------|---------|-----|-----|
-| SRV-Manager | Swarm Manager | 192.168.169.10 | 2 GB | 4 |
-| SRV-Worker | Swarm Worker | 192.168.169.20 | 2 GB | 2 |
-| SRV-STORAGE | NFS Server | 192.168.169.30 | 2 GB | 2 |
+### V1 — GLPI de base (HTTP)
 
-> Les 3 VMs Debian 12 sont fournies via fichier OVF à importer dans VMware Workstation.  
-> Réseau : VMware NAT (toutes les VMs sur le même sous-réseau).
+```
+INTERNET
+    │ HTTP :80
+    ▼
+Azure Load Balancer (IP publique auto)
+    │
+Cluster AKS (Belgium Central)
+    └── Namespace: glpi
+        ├── Pod GLPI (diouxx/glpi)   ──► Service: LoadBalancer (exposé Internet)
+        └── Pod MariaDB (10.11)      ──► Service: ClusterIP (interne)
+                                              └── PVC 5Gi → Azure Disk (auto)
+```
+
+Objets K8s créés : `Namespace` · `Secret` · `ConfigMap` · `PVC` · `2x Deployment` · `2x Service`
+
+### V2 — HTTPS avec Ingress (architecture finale)
+
+```
+INTERNET
+    │ HTTPS :443  →  https://glpi.<IP>.nip.io
+    ▼
+Azure Load Balancer (ingress-nginx)
+    │
+Cluster AKS
+    ├── Namespace: ingress-nginx
+    │   └── Pod ingress-nginx-controller (terminaison SSL + routing)
+    ├── Namespace: cert-manager
+    │   └── cert-manager + ClusterIssuer (Let's Encrypt automatique)
+    └── Namespace: glpi
+        ├── Pod GLPI          ──► Service: ClusterIP
+        └── Pod MariaDB       ──► Service: ClusterIP
+                                        └── PVC 5Gi → Azure Disk
+```
+
+Objets ajoutés en V2 : `ingress-nginx` · `cert-manager` · `ClusterIssuer` · `Ingress`
 
 ---
 
-## 📦 Stack déployée
+## ⚖️ Comparatif des approches
 
-| Service | Image | Replicas | Port |
-|---------|-------|----------|------|
-| GLPI | `saidformation59/labs:glpi-app` | 2 | 8080 |
-| MariaDB | `mysql:8.0` | 1 | — |
-| Redis | `redis:7-alpine` | 1 | — |
+| Critère | Docker Compose | Docker Swarm | Kubernetes AKS |
+|---------|---------------|-------------|----------------|
+| Infrastructure | 1 seule VM | 3 VMs manuelles | VMs gérées par Azure |
+| Haute dispo | ❌ | ⚠️ Partielle | ✅ Native |
+| Stockage | Local | NFS manuel | Azure Disk auto |
+| SSL | Manuel | Manuel | cert-manager auto |
+| IP publique | VMware fixe | VMware NAT | Azure auto |
 
 ---
 
 ## 🚀 Démarrage rapide
 
-### 1. Cloner le repo sur SRV-Manager
+### Prérequis
+
+```powershell
+winget install Microsoft.AzureCLI
+az aks install-cli
+winget install Microsoft.PowerShell
+```
+
+### 1. Connexion Azure
 
 ```bash
-git clone https://github.com/saidpro-lab/Swarm-v2.git
-cd Swarm-v2
-git checkout swarm-v2
+az login --tenant <TENANT_ID>
+az account set --subscription <SUBSCRIPTION_ID>
 ```
 
-### 2. Configurer les variables d'environnement
+### 2. Créer le cluster AKS (portail Azure)
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Resource Group | `rg-gX-glpi` |
+| Nom du cluster | `k8s-cluster` |
+| Configuration | Dev/Test |
+| Taille VM | Standard_B2s |
+| Nœuds | 2 |
+| Zones de dispo | Aucune |
+
+### 3. Connexion au cluster
 
 ```bash
-cp .env.example .env
-nano .env
+az aks get-credentials --resource-group rg-gX-glpi --name k8s-cluster
+kubectl get nodes
 ```
 
-```env
-MYSQL_ROOT_PASSWORD=VotreMotDePasse!
-MYSQL_DATABASE=glpi
-MYSQL_USER=glpi_user
-MYSQL_PASSWORD=GlpiPassword2026!
-GLPI_DB_HOST=db
-GLPI_DB_NAME=glpi
-GLPI_PORT=8080
-```
+### 4. Déployer la stack (V1)
 
 ```bash
-export $(cat .env | xargs)
+kubectl create namespace glpi
+kubectl apply -f manifests/
+kubectl get pods -n glpi -w
 ```
 
-### 3. Initialiser le cluster Swarm
-
-Sur **SRV-Manager** :
-```bash
-docker swarm init --advertise-addr 192.168.169.10
-```
-
-Sur **SRV-Worker** (avec le token généré ci-dessus) :
-```bash
-docker swarm join --token <TOKEN> 192.168.169.10:2377
-```
-
-### 4. Déployer la stack
+### 5. Récupérer l'IP publique
 
 ```bash
-docker stack deploy -c docker-stack.yml glpi
+kubectl get service glpi -n glpi
+# → accéder à http://<EXTERNAL-IP>
 ```
 
-### 5. Vérifier
+**Configuration assistant GLPI :**
+- Serveur SQL : `mariadb`
+- Utilisateur : `glpi_user`
+- Mot de passe : `GlpiP@ssw0rd2026!`
+- Base de données : `glpi`
+
+---
+
+## 🔒 Partie 2 — Activation HTTPS
 
 ```bash
-docker service ls
-docker service ps glpi_glpi
-watch docker service ls
+# cert-manager
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+kubectl get pods -n cert-manager -w
+
+# ingress-nginx
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.1/deploy/static/provider/cloud/deploy.yaml
+kubectl get service ingress-nginx-controller -n ingress-nginx
+# → noter l'EXTERNAL-IP
+
+# Éditer 06-ingress.yaml et 07-clusterissuer.yaml avec votre IP, puis :
+kubectl apply -f manifests/
+kubectl get certificate -n glpi -w
+# → attendre READY = True
 ```
 
-### 6. Accéder à GLPI
-
-```
-http://192.168.169.10:8080
-http://192.168.169.20:8080
-```
+Accès : `https://glpi.<IP>.nip.io`
 
 ---
 
 ## 🗂️ Structure du repo
 
 ```
-Swarm-v2/
-├── docker-stack.yml       # Stack Swarm (services, réseaux, volumes)
-├── .env.example           # Template des variables d'environnement
+Docker-k8s-azure/
+├── manifests/
+│   ├── 00-namespace.yaml
+│   ├── 01-secret.yaml
+│   ├── 02-configmap.yaml
+│   ├── 03-pvc.yaml
+│   ├── 04-mariadb.yaml
+│   ├── 05-glpi.yaml
+│   ├── 06-ingress.yaml
+│   └── 07-clusterissuer.yaml
 └── README.md
 ```
 
@@ -116,52 +173,29 @@ Swarm-v2/
 ## 🔧 Commandes utiles
 
 ```bash
-docker node ls                        # Lister les nœuds du cluster
-docker service ls                     # Lister les services
-docker service ps glpi_glpi           # Voir les tasks d'un service
-docker service scale glpi_glpi=3      # Scaler un service
-docker service logs glpi_glpi         # Voir les logs
-docker service update --force glpi_glpi  # Forcer la redistribution des replicas
-docker stack rm glpi                  # Supprimer la stack
+kubectl get pods -n glpi -w                     # Surveillance temps réel
+kubectl logs <pod-name> -n glpi                 # Logs d'un pod
+kubectl describe pod <pod-name> -n glpi         # Debug
+kubectl get pvc -n glpi                         # Volumes persistants
+kubectl get certificate -n glpi                 # État certificat SSL
+kubectl get ingress -n glpi                     # Règles ingress
 ```
 
 ---
 
-## 🔌 Ports Swarm à ouvrir
+## ⚠️ Nettoyage obligatoire
 
-| Port | Protocole | Usage |
-|------|-----------|-------|
-| 2377 | TCP | Communication Manager ↔ Worker |
-| 7946 | TCP + UDP | Découverte entre nœuds |
-| 4789 | UDP | Réseau Overlay VXLAN |
+> Un cluster AKS qui tourne coûte de l'argent. Supprimez les ressources à la fin du TP !
 
----
-
-## 💾 Stockage NFS (SRV-STORAGE)
-
-Les données persistantes sont partagées via NFS depuis `SRV-STORAGE` :
-
-| Partage NFS | Point de montage | Contenu |
-|-------------|-----------------|---------|
-| `/exports/glpi-files` | `/mnt/glpi-files` | Fichiers GLPI |
-| `/exports/glpi-db` | `/mnt/glpi-db` | Base de données |
-| `/exports/glpi-redis` | `/mnt/glpi-redis` | Cache Redis |
-
----
-
-## 📋 Concepts abordés
-
-- Docker Swarm : Manager, Worker, Service, Task, Stack
-- Réseau Overlay et encapsulation VXLAN
-- Stockage distribué NFS avec `_netdev` dans `/etc/fstab`
-- Haute disponibilité et auto-healing
-- Simulation de panne et observation du comportement Swarm
-- Scaling dynamique (`docker service scale`)
+```bash
+az group delete --name rg-gX-glpi --yes --no-wait
+az group delete --name NetworkWatcherRG --yes --no-wait
+az group list --output table
+```
 
 ---
 
 ## 🏫 Formation
 
 **AIS Bac+3** — Administrateur d'Infrastructures Sécurisées  
-Module : Infrastructure & Conteneurisation  
-Repo lab associé : [saidpro-lab/Swarm-v2](https://github.com/saidpro-lab/Swarm-v2)
+Module : Infrastructure Cloud & Conteneurisation
